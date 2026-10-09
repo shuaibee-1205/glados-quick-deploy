@@ -1,0 +1,117 @@
+name: GLaDOS Quick Deploy
+run-name: GLaDOS Quick Deploy · ${{ inputs.deployment_id || github.event_name }} · ${{ inputs.account_key || 'all' }}
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: Idempotent request identifier
+        type: string
+        default: ''
+      account_key:
+        description: Anonymous account key; empty selects all enabled accounts
+        type: string
+        default: ''
+      operation:
+        description: checkin sends a check-in; status only reads account information
+        type: choice
+        options: [checkin, status]
+        default: checkin
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: glados-quick-deploy
+  cancel-in-progress: false
+  queue: max
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_accounts: ${{ steps.select.outputs.has_accounts }}
+      operation: ${{ steps.select.outputs.operation }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - name: Select accounts and read confirmed recent receipts
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GQD_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GQD_OPERATION: ${{ inputs.operation || 'checkin' }}
+          GQD_TARGET_ACCOUNT: ${{ inputs.account_key }}
+          GQD_SCHEDULE: ${{ github.event.schedule }}
+        run: python .github/glados/runner.py prepare
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.select.outputs.has_accounts == 'true'
+        with:
+          name: gqd-history-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gqd-history/history.json
+          retention-days: 3
+          if-no-files-found: error
+  checkin:
+    needs: prepare
+    if: needs.prepare.outputs.has_accounts == 'true'
+    name: Account ${{ matrix.account }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      GQD_ACCOUNT_KEY: ${{ matrix.account }}
+      GQD_OPERATION: ${{ needs.prepare.outputs.operation }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Read verified upstream
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: lankerr/2026-glados-checkin
+          ref: b4ed1f9abeba4ef6244c0e7fd99333970b81d341
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - name: Install upstream dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir -r upstream/requirements.txt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: gqd-history-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gqd-history
+      - name: Prepare exact account operation
+        id: preflight
+        env:
+          GQD_ACCOUNT_JSON: ${{ secrets[format('GLADOS_ACCOUNT_{0}', matrix.account)] }}
+        run: python .github/glados/runner.py preflight
+      - name: Save durable operation intent before side effects
+        if: steps.preflight.outputs.side_effects == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gqd-intent-${{ matrix.account }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gqd-intent/receipt.json
+          retention-days: 3
+          if-no-files-found: error
+      - name: Check in or refresh account information
+        env:
+          GQD_ACCOUNT_JSON: ${{ secrets[format('GLADOS_ACCOUNT_{0}', matrix.account)] }}
+          PYTHONIOENCODING: utf-8
+        run: python .github/glados/runner.py run
+      - name: Publish anonymous receipt and encrypted details
+        if: always() && steps.preflight.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gqd-result-${{ matrix.account }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gqd-output/
+          retention-days: 3
+          if-no-files-found: error
